@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
   FlatList,
   KeyboardAvoidingView,
@@ -19,6 +20,8 @@ import { ThemedView } from '@/components/themed-view';
 import { Colors } from '@/constants/theme';
 import { Recipe, useAppContext } from '@/context/app-context';
 import { useColorScheme } from '@/hooks/use-color-scheme';
+
+const ANTHROPIC_KEY = process.env.EXPO_PUBLIC_ANTHROPIC_KEY ?? '';
 
 interface DraftIngredient {
   key: string;
@@ -47,6 +50,49 @@ export default function RecipesScreen() {
   // Detail modal
   const [detailVisible, setDetailVisible] = useState(false);
   const [selectedRecipe, setSelectedRecipe] = useState<Recipe | null>(null);
+
+  // Select mode
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  function enterSelectMode() {
+    setSelectMode(true);
+    setSelectedIds(new Set());
+  }
+
+  function exitSelectMode() {
+    setSelectMode(false);
+    setSelectedIds(new Set());
+  }
+
+  function toggleSelected(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function selectAll() {
+    if (selectedIds.size === recipes.length) setSelectedIds(new Set());
+    else setSelectedIds(new Set(recipes.map(r => r.id)));
+  }
+
+  function handleBulkDelete() {
+    if (selectedIds.size === 0) return;
+    Alert.alert('Delete Recipes', `Delete ${selectedIds.size} recipe${selectedIds.size === 1 ? '' : 's'}?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: () => {
+          setRecipes(prev => prev.filter(r => !selectedIds.has(r.id)));
+          exitSelectMode();
+        },
+      },
+    ]);
+  }
 
   function openAddModal() {
     setAddModalKey(k => k + 1);
@@ -166,47 +212,166 @@ export default function RecipesScreen() {
     Alert.alert('Added', `${newItems.length} item${newItems.length === 1 ? '' : 's'} added to your shopping list.`);
   }
 
+  // AI helper
+  const [aiVisible, setAiVisible] = useState(false);
+  const [aiQuestion, setAiQuestion] = useState('');
+  const [aiMessages, setAiMessages] = useState<{ role: 'user' | 'assistant'; text: string }[]>([]);
+  const [aiLoading, setAiLoading] = useState(false);
+  const aiScrollRef = useRef<ScrollView>(null);
+
+  function openAiHelper() {
+    setAiMessages([]);
+    setAiQuestion('');
+    setAiVisible(true);
+  }
+
+  function closeAiHelper() {
+    setAiVisible(false);
+    setAiMessages([]);
+    setAiQuestion('');
+  }
+
+  async function handleAskAi() {
+    const q = aiQuestion.trim();
+    if (!q || !selectedRecipe) return;
+
+    const userMsg = { role: 'user' as const, text: q };
+    const updatedMessages = [...aiMessages, userMsg];
+    setAiMessages(updatedMessages);
+    setAiQuestion('');
+    setAiLoading(true);
+
+    try {
+      const recipeContext = [
+        `Recipe: ${selectedRecipe.name}`,
+        selectedRecipe.ingredients.length > 0
+          ? `Ingredients: ${selectedRecipe.ingredients.map(i => `${i.name}${i.amount ? ` (${i.amount})` : ''}`).join(', ')}`
+          : '',
+        selectedRecipe.description ? `Description: ${selectedRecipe.description}` : '',
+        inventoryItems.length > 0
+          ? `User's current inventory: ${inventoryItems.map(i => i.name).join(', ')}`
+          : '',
+      ].filter(Boolean).join('\n');
+
+      const apiMessages = updatedMessages.map(m => ({
+        role: m.role,
+        content: m.text,
+      }));
+
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': ANTHROPIC_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 512,
+          system: `You are a helpful cooking assistant. Answer questions about the following recipe. Keep answers concise and practical.\n\n${recipeContext}`,
+          messages: apiMessages,
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error?.message ?? `API error ${response.status}`);
+      }
+
+      const data = await response.json();
+      const answer = data.content[0].text.trim();
+      setAiMessages(prev => [...prev, { role: 'assistant', text: answer }]);
+    } catch (e: any) {
+      setAiMessages(prev => [...prev, { role: 'assistant', text: `Error: ${e.message ?? 'Something went wrong.'}` }]);
+    } finally {
+      setAiLoading(false);
+    }
+  }
+
   const inputStyle = [
     styles.input,
     {
       color: colors.text,
       borderColor: colors.icon,
-      backgroundColor: colorScheme === 'dark' ? '#1e2324' : '#f5f5f5',
+      backgroundColor: colors.subtleBackground,
     },
   ];
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]} edges={['top']}>
       <View style={styles.header}>
-        <ThemedText type="title">Recipes</ThemedText>
+        <View style={styles.headerTop}>
+          <ThemedText type="title">Recipes</ThemedText>
+          {recipes.length > 0 && (
+            <Pressable
+              style={[styles.headerBtn, styles.headerBtnOutline, { borderColor: colors.icon }]}
+              onPress={selectMode ? exitSelectMode : enterSelectMode}>
+              <ThemedText style={styles.headerBtnText}>{selectMode ? 'Cancel' : 'Edit'}</ThemedText>
+            </Pressable>
+          )}
+        </View>
         <ThemedText style={{ color: colors.icon }}>
           {recipes.length} {recipes.length === 1 ? 'recipe' : 'recipes'}
         </ThemedText>
+        {selectMode && (
+          <View style={styles.selectBar}>
+            <Pressable
+              onPress={selectAll}
+              style={[styles.selectAllPill, { backgroundColor: colors.subtleBackground }]}>
+              <Text style={[styles.selectAllPillText, { color: colors.tint }]}>
+                {selectedIds.size === recipes.length ? 'Deselect All' : 'Select All'}
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={handleBulkDelete}
+              disabled={selectedIds.size === 0}
+              style={[styles.deletePill, selectedIds.size === 0 && { opacity: 0.4 }]}>
+              <Text style={styles.deletePillText}>
+                Delete ({selectedIds.size})
+              </Text>
+            </Pressable>
+          </View>
+        )}
       </View>
 
       <FlatList
         data={recipes}
         keyExtractor={r => r.id}
         contentContainerStyle={styles.listContent}
-        ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-        renderItem={({ item }) => (
-          <ThemedView style={styles.itemCard}>
-            <Pressable style={styles.itemInfo} onPress={() => openDetailModal(item)}>
-              <ThemedText type="defaultSemiBold" style={styles.itemName}>{item.name}</ThemedText>
-              <ThemedText style={[styles.itemMeta, { color: colors.icon }]}>
-                {item.ingredients.length} {item.ingredients.length === 1 ? 'ingredient' : 'ingredients'}
-              </ThemedText>
-              {item.description ? (
-                <ThemedText numberOfLines={1} style={[styles.itemMeta, { color: colors.icon }]}>
-                  {item.description}
+        ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
+        renderItem={({ item }) => {
+          const isSelected = selectedIds.has(item.id);
+          return (
+            <View style={[styles.itemCard, { backgroundColor: colors.card, borderColor: colors.cardBorder }]}>
+              {selectMode && (
+                <Pressable onPress={() => toggleSelected(item.id)} hitSlop={8} style={styles.selectCheckboxWrap}>
+                  <View style={[styles.selectCircle, isSelected && { backgroundColor: colors.tint, borderColor: colors.tint }]}>
+                    {isSelected && <Text style={styles.selectCheckmark}>✓</Text>}
+                  </View>
+                </Pressable>
+              )}
+              <Pressable
+                style={styles.itemInfo}
+                onPress={() => selectMode ? toggleSelected(item.id) : openDetailModal(item)}>
+                <ThemedText type="defaultSemiBold" style={styles.itemName}>{item.name}</ThemedText>
+                <ThemedText style={[styles.itemMeta, { color: colors.icon }]}>
+                  {item.ingredients.length} {item.ingredients.length === 1 ? 'ingredient' : 'ingredients'}
                 </ThemedText>
-              ) : null}
-            </Pressable>
-            <Pressable onPress={() => handleDeleteRecipe(item.id)} hitSlop={12} style={styles.deleteButton}>
-              <Text style={styles.deleteIcon}>✕</Text>
-            </Pressable>
-          </ThemedView>
-        )}
+                {item.description ? (
+                  <ThemedText numberOfLines={1} style={[styles.itemMeta, { color: colors.icon }]}>
+                    {item.description}
+                  </ThemedText>
+                ) : null}
+              </Pressable>
+              {!selectMode && (
+                <Pressable onPress={() => handleDeleteRecipe(item.id)} hitSlop={12} style={styles.deleteButton}>
+                  <Text style={styles.deleteIcon}>✕</Text>
+                </Pressable>
+              )}
+            </View>
+          );
+        }}
         ListEmptyComponent={
           <View style={styles.emptyState}>
             <ThemedText style={{ color: colors.icon, textAlign: 'center', lineHeight: 24 }}>
@@ -325,6 +490,97 @@ export default function RecipesScreen() {
         </KeyboardAvoidingView>
       </Modal>
 
+      {/* AI Helper Modal */}
+      <Modal
+        visible={aiVisible}
+        animationType="slide"
+        transparent
+        presentationStyle="overFullScreen"
+        onRequestClose={closeAiHelper}>
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          style={styles.modalOverlay}>
+          <Pressable style={styles.modalBackdrop} onPress={closeAiHelper} />
+          <ThemedView style={styles.modalContent}>
+            <View style={styles.detailTitleRow}>
+              <ThemedText type="subtitle" style={[styles.modalTitle, { flex: 1 }]}>
+                Ask AI
+              </ThemedText>
+              <Pressable onPress={closeAiHelper} hitSlop={12}>
+                <Text style={[styles.aiCloseText, { color: colors.icon }]}>✕</Text>
+              </Pressable>
+            </View>
+            {selectedRecipe && (
+              <ThemedText style={[styles.aiRecipeHint, { color: colors.icon }]}>
+                About: {selectedRecipe.name}
+              </ThemedText>
+            )}
+
+            <ScrollView
+              ref={aiScrollRef}
+              style={styles.aiChatScroll}
+              contentContainerStyle={styles.aiChatContent}
+              showsVerticalScrollIndicator={false}
+              onContentSizeChange={() => aiScrollRef.current?.scrollToEnd({ animated: true })}>
+              {aiMessages.length === 0 && (
+                <ThemedText style={[styles.aiPlaceholder, { color: colors.icon }]}>
+                  Ask anything about this recipe — substitutions, cooking tips, dietary adjustments, etc.
+                </ThemedText>
+              )}
+              {aiMessages.map((msg, i) => (
+                <View
+                  key={i}
+                  style={[
+                    styles.aiBubble,
+                    msg.role === 'user'
+                      ? [styles.aiUserBubble, { backgroundColor: colors.tint }]
+                      : [styles.aiAssistantBubble, { backgroundColor: colors.subtleBackground }],
+                  ]}>
+                  <Text
+                    style={[
+                      styles.aiBubbleText,
+                      { color: msg.role === 'user' ? (colorScheme === 'dark' ? '#000' : '#fff') : colors.text },
+                    ]}>
+                    {msg.text}
+                  </Text>
+                </View>
+              ))}
+              {aiLoading && (
+                <View style={[styles.aiBubble, styles.aiAssistantBubble, { backgroundColor: colors.subtleBackground }]}>
+                  <ActivityIndicator size="small" color={colors.icon} />
+                </View>
+              )}
+            </ScrollView>
+
+            <View style={styles.aiInputRow}>
+              <TextInput
+                style={[
+                  styles.aiInput,
+                  {
+                    color: colors.text,
+                    borderColor: colors.icon,
+                    backgroundColor: colors.subtleBackground,
+                  },
+                ]}
+                value={aiQuestion}
+                onChangeText={setAiQuestion}
+                placeholder="e.g. Can I substitute butter for oil?"
+                placeholderTextColor={colors.icon}
+                returnKeyType="send"
+                onSubmitEditing={handleAskAi}
+                editable={!aiLoading}
+              />
+              <Pressable
+                style={[styles.aiSendButton, { backgroundColor: colors.tint }, aiLoading && { opacity: 0.5 }]}
+                onPress={handleAskAi}
+                disabled={aiLoading || !aiQuestion.trim()}>
+                <Text style={[styles.aiSendText, { color: colorScheme === 'dark' ? '#000' : '#fff' }]}>Send</Text>
+              </Pressable>
+            </View>
+          </ThemedView>
+        </KeyboardAvoidingView>
+      </Modal>
+
       {/* Detail Modal */}
       <Modal
         visible={detailVisible}
@@ -339,7 +595,14 @@ export default function RecipesScreen() {
           <ThemedView style={styles.modalContent}>
             {selectedRecipe && (
               <>
-                <ThemedText type="subtitle" style={styles.modalTitle}>{selectedRecipe.name}</ThemedText>
+                <View style={styles.detailTitleRow}>
+                  <ThemedText type="subtitle" style={[styles.modalTitle, { flex: 1 }]}>{selectedRecipe.name}</ThemedText>
+                  <Pressable
+                    style={[styles.aiButton, { backgroundColor: colors.tint }]}
+                    onPress={openAiHelper}>
+                    <Text style={[styles.aiButtonText, { color: colorScheme === 'dark' ? '#000' : '#fff' }]}>Ask AI</Text>
+                  </Pressable>
+                </View>
 
                 <ScrollView
                   style={styles.modalScroll}
@@ -417,6 +680,67 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
     gap: 2,
   },
+  headerTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  headerBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 20,
+  },
+  headerBtnOutline: {
+    borderWidth: 1,
+  },
+  headerBtnText: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  selectBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  selectAllPill: {
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 20,
+  },
+  selectAllPillText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  deletePill: {
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 20,
+    backgroundColor: '#DC2626',
+  },
+  deletePillText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  selectCheckboxWrap: {
+    marginRight: 12,
+  },
+  selectCircle: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 2,
+    borderColor: '#9CA3AF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  selectCheckmark: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '700',
+    lineHeight: 16,
+  },
   listContent: {
     padding: 16,
     flexGrow: 1,
@@ -424,13 +748,14 @@ const styles = StyleSheet.create({
   itemCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 14,
-    borderRadius: 12,
+    padding: 16,
+    borderRadius: 14,
+    borderWidth: 1,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.06,
-    shadowRadius: 4,
-    elevation: 2,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    elevation: 3,
   },
   itemInfo: {
     flex: 1,
@@ -595,5 +920,85 @@ const styles = StyleSheet.create({
   addMissingText: {
     fontWeight: '600',
     fontSize: 16,
+  },
+  detailTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  aiButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 20,
+  },
+  aiButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  aiCloseText: {
+    fontSize: 20,
+    fontWeight: '600',
+  },
+  aiRecipeHint: {
+    fontSize: 13,
+    marginBottom: 4,
+  },
+  aiChatScroll: {
+    flexGrow: 0,
+    maxHeight: 300,
+    marginTop: 8,
+  },
+  aiChatContent: {
+    gap: 8,
+    paddingBottom: 4,
+  },
+  aiPlaceholder: {
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: 'center',
+    paddingVertical: 24,
+  },
+  aiBubble: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 16,
+    maxWidth: '85%',
+  },
+  aiUserBubble: {
+    alignSelf: 'flex-end',
+    borderBottomRightRadius: 4,
+  },
+  aiAssistantBubble: {
+    alignSelf: 'flex-start',
+    borderBottomLeftRadius: 4,
+  },
+  aiBubbleText: {
+    fontSize: 15,
+    lineHeight: 21,
+  },
+  aiInputRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 12,
+  },
+  aiInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    fontSize: 15,
+  },
+  aiSendButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  aiSendText: {
+    fontSize: 14,
+    fontWeight: '600',
   },
 });
